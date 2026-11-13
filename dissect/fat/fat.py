@@ -10,9 +10,6 @@ from functools import lru_cache, reduce
 from operator import itemgetter
 from typing import TYPE_CHECKING, BinaryIO
 
-from dissect.util.stream import RangeStream, RunlistStream
-from dissect.util.ts import dostimestamp
-
 from dissect.fat.c_fat import (
     BAD_CLUSTER,
     DATA_CLUSTER_MAX,
@@ -31,10 +28,11 @@ from dissect.fat.exceptions import (
     FileNotFoundError,
     FreeClusterError,
     InvalidBPB,
-    InvalidDirectoryError,
     LastEmptyDirectoryError,
     NotADirectoryError,
 )
+from dissect.util.stream import RangeStream, RunlistStream
+from dissect.util.ts import dostimestamp
 
 if TYPE_CHECKING:
     from collections.abc import Iterator
@@ -237,6 +235,48 @@ class FAT:
             yield (run_start, run_size)
 
 
+def lfn_checksum(short_name: bytes) -> int:
+    """Calculate the long file name checksum of an 11 byte short (8.3) file name."""
+    checksum = 0
+    for c in short_name:
+        checksum = (((checksum & 1) << 7) + (checksum >> 1) + c) & 0xFF
+    return checksum
+
+
+def _select_lfn_group(ldirents: list, short_name: bytes) -> tuple[list | None, str | None]:
+    """Select and validate the group of long name entries that belongs to a short name entry.
+
+    Long name entries are stored last-entry-first, directly preceding their short name entry.
+    Orphaned entries left behind by deleted files may precede the actual group, so only the
+    group starting at the final last-long entry is considered.
+
+    Returns the validated group, or ``None`` and a human-readable reason why the long name
+    was rejected. In that case only the short name can be trusted.
+    """
+    start = None
+    for i in range(len(ldirents) - 1, -1, -1):
+        if ldirents[i].LDIR_Ord & c_fat.LAST_LONG_ENTRY:
+            start = i
+            break
+
+    if start is None:
+        return None, "long name sequence is missing the last-long entry"
+
+    group = ldirents[start:]
+    ords = [e.LDIR_Ord & 0x3F for e in group]
+    if sorted(ords) != list(range(1, ords[0] + 1)):
+        return None, "long name sequence has missing or duplicate entries"
+
+    checksums = {e.LDIR_Chksum for e in group}
+    if len(checksums) != 1:
+        return None, "long name entries have inconsistent checksums"
+
+    if checksums.pop() != lfn_checksum(short_name):
+        return None, "long name checksum does not match the short name"
+
+    return group, None
+
+
 class DirectoryEntry:
     def __init__(self, fs: FATFS, fh: BinaryIO, parent: DirectoryEntry | RootDirectory | None = None):
         self.fs = fs
@@ -244,6 +284,7 @@ class DirectoryEntry:
 
         self.dirent = None
         self.ldirents = []
+        self.lfn_invalid = None
 
         self.name = None
         self.short_name = None
@@ -259,25 +300,28 @@ class DirectoryEntry:
 
         if dirent.DIR_Attr & c_fat.ATTR_LONG_NAME_MASK == c_fat.ATTR_LONG_NAME:
             ldirent = c_fat.Ldirent(buf)
-            found_last = False
             while ldirent.LDIR_Attr == c_fat.ATTR_LONG_NAME:
                 self.ldirents.append(ldirent)
-                if ldirent.LDIR_Ord & c_fat.LAST_LONG_ENTRY:
-                    if found_last:
-                        raise InvalidDirectoryError("Dirent contains multiple last-long entries")
-                    found_last = True
 
                 buf = fh.read(32)
                 ldirent = c_fat.Ldirent(buf)
 
-            self.dirent = c_fat.Dirent(buf)
+            dirent = c_fat.Dirent(buf)
 
-            self.ldirents.sort(key=lambda e: e.LDIR_Ord & 0x3F)
-            name_map = (e.LDIR_Name1 + e.LDIR_Name2 + e.LDIR_Name3 for e in self.ldirents)
-            name_reduce = bytes(reduce(lambda a, b: a + b, name_map))
-            self.name = c_fat.wchar[None](name_reduce + b"\x00\x00")
-        else:
-            self.dirent = dirent
+            if dirent.DIR_Name[0] == 0xE5:
+                raise EmptyDirectoryError("Long name entries belong to a deleted dirent")
+
+            if dirent.DIR_Name[0] == 0x0:
+                raise LastEmptyDirectoryError("Long name entries are not followed by a dirent")
+
+            lfn_group, self.lfn_invalid = _select_lfn_group(self.ldirents, bytes(dirent.DIR_Name))
+            if lfn_group is not None:
+                lfn_group = sorted(lfn_group, key=lambda e: e.LDIR_Ord & 0x3F)
+                name_map = (e.LDIR_Name1 + e.LDIR_Name2 + e.LDIR_Name3 for e in lfn_group)
+                name_reduce = bytes(reduce(lambda a, b: a + b, name_map))
+                self.name = c_fat.wchar[None](name_reduce + b"\x00\x00")
+
+        self.dirent = dirent
 
         dir_name = bytearray(self.dirent.DIR_Name)
         if dir_name[0] == 0x05:
@@ -375,6 +419,7 @@ class RootDirectory(DirectoryEntry):
         self.fs = fs
         self.name = "\\"
         self.short_name = self.name
+        self.lfn_invalid = None
 
         self._runlist = None
         self._entries = None
