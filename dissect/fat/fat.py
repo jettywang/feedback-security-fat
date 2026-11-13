@@ -35,9 +35,12 @@ from dissect.fat.exceptions import (
     LastEmptyDirectoryError,
     NotADirectoryError,
 )
+from dissect.fat.timestamps import TimeKind, decode_fat
 
 if TYPE_CHECKING:
     from collections.abc import Iterator
+
+    from dissect.fat.timestamps import ForensicTimestamp
 
 
 class FATFS:
@@ -328,6 +331,26 @@ class DirectoryEntry:
     @property
     def mtime(self) -> datetime.datetime:
         return dostimestamp((self.dirent.DIR_WrtDate << 16) | self.dirent.DIR_WrtTime)
+
+    @property
+    def forensic_ctime(self) -> ForensicTimestamp:
+        """Created time with raw fields, 10 ms precision and FAT timezone uncertainty preserved."""
+        return decode_fat(
+            TimeKind.CREATED,
+            self.dirent.DIR_CrtDate,
+            self.dirent.DIR_CrtTime,
+            self.dirent.DIR_CrtTimeTenth,
+        )
+
+    @property
+    def forensic_atime(self) -> ForensicTimestamp:
+        """Last-access date (date only, one-day precision); never a fabricated 1980 value."""
+        return decode_fat(TimeKind.ACCESSED, self.dirent.DIR_LstAccDate)
+
+    @property
+    def forensic_mtime(self) -> ForensicTimestamp:
+        """Modified time with raw fields, 2 s precision and FAT timezone uncertainty preserved."""
+        return decode_fat(TimeKind.MODIFIED, self.dirent.DIR_WrtDate, self.dirent.DIR_WrtTime)
 
     def is_readonly(self) -> bool:
         return bool(self.dirent.DIR_Attr & c_fat.ATTR_READ_ONLY)

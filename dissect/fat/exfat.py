@@ -6,7 +6,7 @@ import struct
 from collections import OrderedDict
 from itertools import groupby
 from operator import itemgetter
-from typing import BinaryIO
+from typing import TYPE_CHECKING, BinaryIO
 
 from dissect.util.stream import RangeStream, RunlistStream
 
@@ -22,6 +22,10 @@ from dissect.fat.c_exfat import (
     c_exfat,
 )
 from dissect.fat.exceptions import InvalidHeaderMagic
+from dissect.fat.timestamps import TimeKind, TimezonePolicy, decode_exfat
+
+if TYPE_CHECKING:
+    from dissect.fat.timestamps import ForensicTimestamp
 
 __all__ = ["ExFAT"]
 
@@ -147,30 +151,72 @@ class ExFAT:
     def _utc_timezone(timezone: int) -> dict[str, str | int]:
         """Converts a Microsoft exFAT timezone byte to its UTC timezone equivalent.
 
+        This preserves the historical Linux-kernel (bias-0, signed 7-bit) convention used by this
+        parser: bit 7 is the validity flag and the low seven bits are a signed 15-minute count.
+        Note that [MS-XFS], The Sleuth Kit and relan/exfat instead use a bias-64 encoding
+        (``offset = (byte & 0x7f) - 64``); the same byte therefore decodes differently across
+        drivers. Case work should use :func:`forensic_timestamps`, which keeps the raw byte and both
+        interpretations instead of committing to one.
+
         Args:
             timezone (int): exFAT timezone byte
 
         Returns:
             dict: UTC name (str), UTC offset in minutes (int)
         """
-        #    utc_bool -64 32 16 : 8 4 2 1
-        #              ^ sign
-        TIMEZONE_MINUTE_INCREMENT = 15
-        utc_enabled = timezone >> 7
-        signed = (timezone >> 6) & 0x11  # Check if the second bit is set
+        timezone_minute_increment = 15
 
-        if utc_enabled:
-            if signed:
-                utc_minute_offset = ((timezone & 0x3F) - 64) * TIMEZONE_MINUTE_INCREMENT
-            else:
-                utc_minute_offset = (timezone & 0x7F) * TIMEZONE_MINUTE_INCREMENT
+        if not timezone >> 7:
+            return {"name": "localtime", "offset": 0}
 
-            hours, minutes = divmod(utc_minute_offset, 60)
-            utc_name = f"UTC{hours:+03}:{minutes:02}"
+        signed_value = (timezone & 0x7F) - 128 if (timezone & 0x7F) >= 64 else timezone & 0x7F
+        utc_minute_offset = signed_value * timezone_minute_increment
+        hours, minutes = divmod(abs(utc_minute_offset), 60)
+        sign = "+" if utc_minute_offset >= 0 else "-"
+        utc_name = f"UTC{sign}{hours:02d}:{minutes:02d}"
 
-            return {"name": utc_name, "offset": utc_minute_offset}
+        return {"name": utc_name, "offset": utc_minute_offset}
 
-        return {"name": "localtime", "offset": 0}
+
+def forensic_timestamps(
+    file_entry: c_exfat.FILE, policy: TimezonePolicy = TimezonePolicy.SPEC
+) -> dict[TimeKind, ForensicTimestamp]:
+    """Decode all three timestamps of an exFAT ``FILE`` entry with full uncertainty retained.
+
+    Each timestamp has its own UTC-offset validity bit, so one field may carry a usable offset while
+    another does not, even within the same entry. Created/modified carry a centisecond byte (10 ms
+    granularity); accessed has none and stays at the packed 2-second granularity.
+
+    Args:
+        file_entry (c_exfat.FILE): parsed exFAT file directory entry
+        policy (TimezonePolicy): driver convention to use when decoding valid offset bytes
+
+    Returns:
+        dict[TimeKind, ForensicTimestamp]: created, modified and accessed timestamps
+    """
+    metadata = file_entry.metadata
+    return {
+        TimeKind.CREATED: decode_exfat(
+            TimeKind.CREATED,
+            metadata.create_time,
+            metadata.create_timezone,
+            metadata.create_offset,
+            policy,
+        ),
+        TimeKind.MODIFIED: decode_exfat(
+            TimeKind.MODIFIED,
+            metadata.modified_time,
+            metadata.modified_timezone,
+            metadata.modified_offset,
+            policy,
+        ),
+        TimeKind.ACCESSED: decode_exfat(
+            TimeKind.ACCESSED,
+            metadata.access_time,
+            metadata.access_timezone,
+            policy=policy,
+        ),
+    }
 
 
 class RootDirectory:
