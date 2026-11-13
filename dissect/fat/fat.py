@@ -227,7 +227,7 @@ class FAT:
         run_size = 1
 
         for cl in chain:
-            if cl == run_start + run_size:
+            if cl - 2 == run_start + run_size:
                 run_size += 1
             else:
                 yield (run_start, run_size)
