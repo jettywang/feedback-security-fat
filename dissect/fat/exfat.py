@@ -90,35 +90,60 @@ class ExFAT:
 
         Args:
             starting_cluster (int): First cluster of file, folder or location in question
+            not_fragmented (bool): Whether the stream is stored in contiguous clusters (the exFAT
+                NoFatChain flag). In that case the FAT must not be consulted, because its entries
+                for this stream are undefined.
+            size (int): Size of the stream in bytes. When given, the runlist is limited to the
+                number of clusters needed to cover this size. The last run may still describe a
+                full cluster, while ``RunlistStream`` uses ``size`` to hide the slack space.
+                When omitted, the full allocation is used (fragmented) or a single cluster is
+                assumed (contiguous), since no extent length is known.
 
         Returns:
             runlist: [(sector_offset, run_length_in_sectors)]
         """
-        # If file is not fragmented clusters will not be present in the FAT
-        cluster_chain = [starting_cluster] if not_fragmented else self.get_cluster_chain(starting_cluster)
-        runlist = []
         sectors_per_cluster = 2**self.vbr.sectors_per_cluster_exp
 
-        # TODO Graceful way to construct a runlist of non-fragmented streams spanning multiple sectors
-        if size:
-            run = -(-size // self.cluster_size) * sectors_per_cluster
-            runlist.append((self.cluster_to_sector(cluster_chain[0]), run))
+        # Determine how many clusters are needed to cover the declared stream size. A size of
+        # zero means there is no data at all, while an unknown size (root directory) means the
+        # full cluster chain/allocation has to be used.
+        cluster_count = None if size is None else -(-size // self.cluster_size)
+        if cluster_count == 0:
+            return []
+
+        if not_fragmented:
+            # NoFatChain: clusters are consecutive and the FAT entries are not populated.
+            if not self._valid_cluster(starting_cluster):
+                return []
+
+            # Without a size only the starting cluster can be assumed to belong to the stream.
+            count = cluster_count if cluster_count is not None else 1
+            # Never construct runs outside of the cluster heap.
+            count = min(count, self.cluster_count + 2 - starting_cluster)
+            cluster_chain = list(range(starting_cluster, starting_cluster + count))
         else:
-            # This is a somewhat convoluted, but short way to group successive
-            # clusters together.
-            # As the cluster numbers in the cluster_chain are strictly
-            # incrementing, a successive range of clusters will have the same
-            # delta with respect to their position in the cluster_chain, which
-            # is different from any other successive range, which is what is
-            # used in the groupby().
-            # Example: [(3, 1), (4, 1), (6, 1)] becomes [(3, 2), (6, 1)]
-            for _, cluster_group in groupby(enumerate(cluster_chain), lambda i: i[0] - i[1]):
-                run = list(map(itemgetter(1), cluster_group))
-                start_cluster = run[0]
-                run_len = len(run) * sectors_per_cluster
-                runlist.append((self.cluster_to_sector(start_cluster), run_len))
+            cluster_chain = self.get_cluster_chain(starting_cluster)
+            if cluster_count is not None:
+                # A chain that is shorter than the declared size simply ends early. Do not
+                # substitute adjacent clusters for the missing chain entries.
+                cluster_chain = cluster_chain[:cluster_count]
+
+        runlist = []
+        # Group successive clusters into a single run. Consecutive cluster numbers have the
+        # same delta with respect to their position in the chain, which is what is used in
+        # the groupby(). A jump to a non-consecutive cluster starts a new group.
+        # Example: [(3, 1), (4, 1), (6, 1)] becomes [(3, 2), (6, 1)]
+        for _, cluster_group in groupby(enumerate(cluster_chain), lambda i: i[0] - i[1]):
+            run = list(map(itemgetter(1), cluster_group))
+            start_cluster = run[0]
+            run_len = len(run) * sectors_per_cluster
+            runlist.append((self.cluster_to_sector(start_cluster), run_len))
 
         return runlist
+
+    def _valid_cluster(self, cluster: int) -> bool:
+        """Return whether ``cluster`` is a valid cluster number in this volume."""
+        return 2 <= cluster < self.cluster_count + 2
 
     def get_cluster_chain(self, starting_cluster: int) -> list[int]:
         """Reads the on disk FAT to construct the cluster chain.
@@ -129,17 +154,26 @@ class ExFAT:
         Returns:
             list: Chain of clusters. Including starting_cluster
         """
-        next_ = 0x00000000
         chain = []
+        seen = set()
 
-        if starting_cluster < 2:
+        if not self._valid_cluster(starting_cluster):
             return chain
 
-        while next_ != EOC:
-            self.fat.seek(starting_cluster * FAT_ENTRY_SIZE)
-            next_ = struct.unpack("<L", self.fat.read(FAT_ENTRY_SIZE))[0]
+        while self._valid_cluster(starting_cluster) and starting_cluster not in seen:
+            seen.add(starting_cluster)
             chain.append(starting_cluster)
-            starting_cluster = next_
+
+            self.fat.seek(starting_cluster * FAT_ENTRY_SIZE)
+            entry = self.fat.read(FAT_ENTRY_SIZE)
+            if len(entry) < FAT_ENTRY_SIZE:
+                break
+
+            next_cluster = struct.unpack("<L", entry)[0]
+            if next_cluster == EOC:
+                break
+
+            starting_cluster = next_cluster
 
         return chain
 
@@ -190,11 +224,9 @@ class RootDirectory:
         # Root dir is always present in FAT so we pass False to traverse the FAT table
         # thus root dir is per definition fragmented
         runlist = self.exfat.runlist(self.location, False)
-        size = 0  # in bytes
 
         # Calculate size of rootdir from runlist since rootdir has no size attribute
-        for run in runlist:
-            size += run[1] * self.exfat.sector_size
+        size = sum(run[1] * self.exfat.sector_size for run in runlist)
 
         self.size = size
         self.root_dir = RunlistStream(fh, runlist, self.size, self.exfat.sector_size)
@@ -211,7 +243,9 @@ class RootDirectory:
         """
         folder_location = entry.stream.location
         folder_size = entry.stream.data_length  # in bytes
-        folder_runlist = self.exfat.runlist(folder_location, not_fragmented=entry.stream.flags.not_fragmented)
+        folder_runlist = self.exfat.runlist(
+            folder_location, not_fragmented=entry.stream.flags.not_fragmented, size=folder_size
+        )
 
         fh = RunlistStream(self.exfat.filesystem, folder_runlist, folder_size, self.exfat.sector_size)
         return self._parse_file_entries(fh)
@@ -249,7 +283,13 @@ class RootDirectory:
         entries = OrderedDict()
 
         while fh.tell() < fh.size:
-            entry = c_exfat.FILE_DIRECTORY_ENTRY(fh.read(DIR_ENTRY_SIZE))
+            raw_entry = fh.read(DIR_ENTRY_SIZE)
+            if len(raw_entry) < DIR_ENTRY_SIZE:
+                # The directory ended before its declared size (e.g. a truncated cluster chain).
+                # Do not parse the remaining (missing) bytes or fall back to adjacent clusters.
+                break
+
+            entry = c_exfat.FILE_DIRECTORY_ENTRY(raw_entry)
 
             if entry.entry_type == FILE_ENTRY:  # Or entry.entry_type == 0x05:
                 # Entry is a file so we reuse it
@@ -257,9 +297,21 @@ class RootDirectory:
 
                 # -1 because the metadata entry includes the stream dir entry in its count
                 fnentry_count = metadata.subentry_count - 1
+                if fnentry_count < 1:
+                    # A malformed entry without a stream entry has no usable data.
+                    continue
 
-                stream = c_exfat.STREAM_DIRECTORY_ENTRY(fh.read(DIR_ENTRY_SIZE))
-                fn_entries = [c_exfat.FILENAME_DIRECTORY_ENTRY(fh.read(DIR_ENTRY_SIZE)) for _ in range(fnentry_count)]
+                raw_stream = fh.read(DIR_ENTRY_SIZE)
+                raw_filenames = fh.read(fnentry_count * DIR_ENTRY_SIZE)
+                if len(raw_stream) < DIR_ENTRY_SIZE or len(raw_filenames) < fnentry_count * DIR_ENTRY_SIZE:
+                    # The entry set crosses the end of the directory. Skip the incomplete entry.
+                    break
+
+                stream = c_exfat.STREAM_DIRECTORY_ENTRY(raw_stream)
+                fn_entries = [
+                    c_exfat.FILENAME_DIRECTORY_ENTRY(raw_filenames[offset : offset + DIR_ENTRY_SIZE])
+                    for offset in range(0, len(raw_filenames), DIR_ENTRY_SIZE)
+                ]
 
                 file_ = c_exfat.FILE(metadata=metadata, stream=stream, fn_entries=fn_entries)
                 if file_.metadata.attributes.directory:
